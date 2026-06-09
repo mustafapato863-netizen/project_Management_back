@@ -1,128 +1,144 @@
-import fs from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { MongoClient, ObjectId } from "mongodb";
+import dotenv from "dotenv";
 import type { Project, ProjectDatabase } from "./types.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, "../data");
-const DB_FILE = path.join(DATA_DIR, "projects.json");
+// تفعيل قراءة متغيرات البيئة من ملف .env محلياً أو من سرفر Render الإنتاجي
+dotenv.config();
 
-let writeQueue: Promise<unknown> = Promise.resolve();
-
-function withWriteLock<T>(operation: () => Promise<T>): Promise<T> {
-  const run = writeQueue.then(operation, operation);
-  writeQueue = run.then(
-    () => undefined,
-    () => undefined,
+const url = process.env.DATABASE_URL || "";
+if (!url) {
+  console.error(
+    "⚠️ CRITICAL ERROR: DATABASE_URL environment variable is missing!",
   );
-  return run;
 }
 
-async function ensureDatabase(): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+const client = new MongoClient(url);
+const DB_NAME = "project_manager";
+const COLLECTION_NAME = "projects";
 
+// دالة مركزية للوصول لجدول المشاريع بـ MongoDB
+async function getCollection() {
+  await client.connect();
+  const db = client.db(DB_NAME);
+  return db.collection(COLLECTION_NAME);
+}
+
+// 1. جلب حالة قاعدة البيانات الإجمالية (تاريخ التحديث + العدد)
+export async function getDatabase(): Promise<ProjectDatabase> {
   try {
-    await fs.access(DB_FILE);
-  } catch {
-    const initial: ProjectDatabase = {
+    const collection = await getCollection();
+    const projectsRaw = await collection.find({}).toArray();
+
+    // تحويل الـ _id الخاص بـ MongoDB إلى id نصي متوافق مع الـ Frontend
+    const projects = projectsRaw.map((p) => ({
+      ...p,
+      id: p._id.toString(),
+    })) as unknown as Project[];
+
+    // محاكاة بنية الـ JSON القديمة لإرضاء الـ Router
+    return {
       updatedAt: new Date().toISOString(),
-      projects: [],
+      projects: projects,
     };
-    await fs.writeFile(DB_FILE, JSON.stringify(initial, null, 2), "utf-8");
+  } catch (error) {
+    console.error("MongoDB: Error fetching database structure", error);
+    return { updatedAt: new Date().toISOString(), projects: [] };
   }
 }
 
-async function readDatabase(): Promise<ProjectDatabase> {
-  await ensureDatabase();
-  const raw = await fs.readFile(DB_FILE, "utf-8");
-  return JSON.parse(raw) as ProjectDatabase;
-}
-
-async function writeDatabase(data: ProjectDatabase): Promise<void> {
-  await ensureDatabase();
-  const payload = {
-    ...data,
-    updatedAt: new Date().toISOString(),
-  };
-  const tempFile = `${DB_FILE}.${process.pid}.tmp`;
-  await fs.writeFile(tempFile, JSON.stringify(payload, null, 2), "utf-8");
-  await fs.rename(tempFile, DB_FILE);
-}
-
-export async function getDatabase(): Promise<ProjectDatabase> {
-  return readDatabase();
-}
-
+// 2. جلب قائمة كل المشاريع
 export async function getProjects(): Promise<Project[]> {
-  const db = await readDatabase();
-  return db.projects;
+  const dbData = await getDatabase();
+  return dbData.projects;
 }
 
+// 3. جلب مشروع واحد بواسطة الـ ID
 export async function getProjectById(id: string): Promise<Project | undefined> {
-  const db = await readDatabase();
-  return db.projects.find((project) => project.id === id);
+  try {
+    const collection = await getCollection();
+    // التحقق من صلاحية الـ ID حتى لا ينهار السيرفر إذا أرسل الـ Frontend نصاً عشوائياً
+    if (!ObjectId.isValid(id)) return undefined;
+
+    const project = await collection.findOne({ _id: new ObjectId(id) });
+    if (!project) return undefined;
+
+    return { ...project, id: project._id.toString() } as unknown as Project;
+  } catch (error) {
+    console.error(`MongoDB: Error fetching project with id ${id}`, error);
+    return undefined;
+  }
 }
 
+// 4. إنشاء مشروع جديد
 export async function createProject(
   project: Omit<Project, "id" | "createdAt" | "updatedAt">,
 ): Promise<Project> {
-  return withWriteLock(async () => {
-    const db = await readDatabase();
-    const now = new Date().toISOString();
-    const newProject: Project = {
-      ...project,
-      id: crypto.randomUUID(),
-      createdAt: now,
-      updatedAt: now,
-    };
+  const collection = await getCollection();
+  const now = new Date().toISOString();
 
-    db.projects.push(newProject);
-    await writeDatabase(db);
-    return newProject;
-  });
+  const newProjectData = {
+    ...project,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  // MongoDB تولد الـ Unique ID تلقائياً في خانة _id
+  const result = await collection.insertOne(newProjectData);
+
+  return {
+    ...newProjectData,
+    id: result.insertedId.toString(),
+  } as unknown as Project;
 }
 
+// 5. تحديث مشروع قائم
 export async function updateProject(
   id: string,
   updates: Partial<Project>,
 ): Promise<Project | null> {
-  return withWriteLock(async () => {
-    const db = await readDatabase();
-    const index = db.projects.findIndex((project) => project.id === id);
+  try {
+    const collection = await getCollection();
+    if (!ObjectId.isValid(id)) return null;
 
-    if (index === -1) {
-      return null;
-    }
+    const now = new Date().toISOString();
+    // إزالة الحقول الحساسة المعرفة مسبقاً حتى لا يتم تغييرها بالخطأ
+    const { id: _, createdAt: __, updatedAt: ___, ...cleanUpdates } = updates;
 
-    const updatedProject: Project = {
-      ...db.projects[index],
-      ...updates,
-      id: db.projects[index].id,
-      createdAt: db.projects[index].createdAt,
-      updatedAt: new Date().toISOString(),
+    const finalUpdates = {
+      ...cleanUpdates,
+      updatedAt: now,
     };
 
-    db.projects[index] = updatedProject;
-    await writeDatabase(db);
-    return updatedProject;
-  });
+    const result = await collection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: finalUpdates },
+      { returnDocument: "after" }, // إرجاع المستند بعد التحديث
+    );
+
+    if (!result) return null;
+
+    return { ...result, id: result._id.toString() } as unknown as Project;
+  } catch (error) {
+    console.error(`MongoDB: Error updating project with id ${id}`, error);
+    return null;
+  }
 }
 
+// 6. حذف مشروع
 export async function deleteProject(id: string): Promise<boolean> {
-  return withWriteLock(async () => {
-    const db = await readDatabase();
-    const nextProjects = db.projects.filter((project) => project.id !== id);
+  try {
+    const collection = await getCollection();
+    if (!ObjectId.isValid(id)) return false;
 
-    if (nextProjects.length === db.projects.length) {
-      return false;
-    }
-
-    db.projects = nextProjects;
-    await writeDatabase(db);
-    return true;
-  });
+    const result = await collection.deleteOne({ _id: new ObjectId(id) });
+    return result.deletedCount > 0;
+  } catch (error) {
+    console.error(`MongoDB: Error deleting project with id ${id}`, error);
+    return false;
+  }
 }
 
+// 7. دالة وهمية للحفاظ على توافقية الكود القديم إذا تمت مناداتها
 export function getDatabaseFilePath(): string {
-  return DB_FILE;
+  return "CONNECTED_TO_MONGODB_ATLAS";
 }
