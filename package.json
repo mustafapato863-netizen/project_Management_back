@@ -1,0 +1,25 @@
+{
+  "name": "project-manager-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "dev:frontend": "npm --prefix ../Frontend run dev",
+    "dev:all": "concurrently \"npm run dev\" \"npm --prefix ../Frontend run dev\""
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^24.10.1",
+    "tsx": "^4.19.3",
+    "typescript": "^5.9.3"
+  }
+}
